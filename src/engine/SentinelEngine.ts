@@ -1,19 +1,19 @@
-import { SHA256 } from './crypto'; // We'll implement a simple SHA256 wrapper or use a library if available, but for "no external APIs" in the logic, we might need a simple JS implementation or use the browser's crypto.subtle (which is async).
-// Actually, the prompt asked for "hashlib" in Python. In JS, crypto.subtle is async.
-// To keep it synchronous as requested ("No async" for the logic), I should use a synchronous SHA256 library or implementation.
-// I'll use a simple synchronous SHA256 implementation for the demo to strictly adhere to "deterministic" and "sync" where possible in the logic layer.
+import { SHA256 } from './crypto';
 
-// --- Types ---
+// ─────────────────────────────────────────────
+// TYPES
+// ─────────────────────────────────────────────
 
 export interface Transaction {
   transaction_id: string;
   user_id: string;
   amount: number;
-  timestamp: number; // Unix timestamp
+  timestamp: number;
   device_id: string;
   ip_address: string;
   location: { lat: number; lon: number; city: string };
   merchant_id: string;
+  merchant_category?: string;
   network_type: 'WIFI' | '4G' | '5G' | 'VPN' | 'UNKNOWN';
   session_id: string;
 }
@@ -40,6 +40,16 @@ export interface RiskResult {
   multiplier?: number;
 }
 
+export type ReasonCode =
+  | 'ERR_VELOCITY_LIMIT'
+  | 'ERR_GEO_IMPOSSIBLE'
+  | 'ERR_BEHAVIORAL_SHIFT'
+  | 'ERR_COORDINATED_ATTACK'
+  | 'ERR_ESCALATION_OVERRIDE'
+  | 'ERR_CHAIN_MISMATCH'
+  | 'ERR_BLOCKED_USER'
+  | 'OK';
+
 export interface FinalRiskResult {
   transaction_id: string;
   user_id: string;
@@ -56,7 +66,11 @@ export interface FinalRiskResult {
   };
   decision: 'APPROVE' | 'STEP_UP' | 'BLOCK';
   reasoning: string[];
+  reason_code: ReasonCode;
   processing_time_ms: number;
+  latency_breach: boolean;
+  coordinated_attack: boolean;
+  escalation_override: boolean;
 }
 
 export interface LedgerEntry {
@@ -70,60 +84,172 @@ export interface LedgerEntry {
   data_hash: string; // Hash of the transaction data itself
 }
 
-// --- Constants ---
+// ─────────────────────────────────────────────
+// CONSTANTS — spec-mandated thresholds
+// ─────────────────────────────────────────────
 
-const R_EARTH_KM = 6371;
-const MAX_VELOCITY_WINDOW_MIN = 10;
-const MAX_SPEED_KMH = 800; // Impossible travel speed
+const R_EARTH_KM      = 6371;
+const MAX_SPEED_KMH   = 800;
 
-// --- Helper Functions ---
+// Risk thresholds (spec §2)
+export const THRESHOLD_PASS  = 40;   // < 40  → APPROVE
+export const THRESHOLD_BLOCK = 70;   // ≥ 70  → BLOCK
+                                      // 40–69 → STEP_UP
+
+// Latency (spec §6)
+const MAX_LATENCY_MS  = 200;
+const LATENCY_WINDOW  = 10;
+
+// Coordinated attack (spec §4)
+const COORD_WINDOW_MS       = 2 * 60 * 1000;
+const COORD_MIN_USERS       = 5;
+const COORD_AMOUNT_VARIANCE = 0.05;
+const COORD_MULTIPLIER      = 1.25;
+
+// Progressive escalation (spec §5)
+const ESC_WINDOW_MS   = 15 * 60 * 1000;
+const ESC_MIN_STEPUPS = 3;
+const ESC_RISK_THRESH = 60;
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const dLat = (lat2 - lat1) * (Math.PI / 180);
   const dLon = (lon2 - lon1) * (Math.PI / 180);
   const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLat / 2) ** 2 +
     Math.cos(lat1 * (Math.PI / 180)) *
-      Math.cos(lat2 * (Math.PI / 180)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R_EARTH_KM * c;
+    Math.cos(lat2 * (Math.PI / 180)) *
+    Math.sin(dLon / 2) ** 2;
+  return R_EARTH_KM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// --- Risk Engines ---
+function clamp(v: number, min = 0, max = 100): number {
+  return Math.min(max, Math.max(min, v));
+}
+
+// ─────────────────────────────────────────────
+// ROLLING LATENCY BUFFER (spec §6)
+// ─────────────────────────────────────────────
+
+class RollingLatencyBuffer {
+  private buffer: number[] = [];
+
+  record(ms: number): void {
+    this.buffer.push(ms);
+    if (this.buffer.length > LATENCY_WINDOW) this.buffer.shift();
+  }
+
+  average(): number {
+    if (!this.buffer.length) return 0;
+    return this.buffer.reduce((a, b) => a + b, 0) / this.buffer.length;
+  }
+
+  isBreach(): boolean { return this.average() > MAX_LATENCY_MS; }
+  snapshot(): number[] { return [...this.buffer]; }
+}
+
+// ─────────────────────────────────────────────
+// COORDINATED ATTACK DETECTOR (spec §4)
+// ─────────────────────────────────────────────
+
+interface CoordEvent {
+  user_id: string;
+  merchant_category: string;
+  amount: number;
+  timestamp: number;
+}
+
+class CoordinatedAttackDetector {
+  private events: CoordEvent[] = [];
+
+  record(tx: Transaction): void {
+    const now = tx.timestamp;
+    this.events = this.events.filter(e => now - e.timestamp <= COORD_WINDOW_MS);
+    this.events.push({
+      user_id:           tx.user_id,
+      merchant_category: tx.merchant_category ?? tx.merchant_id,
+      amount:            tx.amount,
+      timestamp:         now,
+    });
+    if (this.events.length > 5000) this.events = this.events.slice(-5000);
+  }
+
+  detect(tx: Transaction): boolean {
+    const now     = tx.timestamp;
+    const cat     = tx.merchant_category ?? tx.merchant_id;
+    const window  = this.events.filter(e => now - e.timestamp <= COORD_WINDOW_MS);
+    const amtLow  = tx.amount * (1 - COORD_AMOUNT_VARIANCE);
+    const amtHigh = tx.amount * (1 + COORD_AMOUNT_VARIANCE);
+    const cluster = window.filter(
+      e => e.merchant_category === cat && e.amount >= amtLow && e.amount <= amtHigh
+    );
+    return new Set(cluster.map(e => e.user_id)).size >= COORD_MIN_USERS;
+  }
+}
+
+// ─────────────────────────────────────────────
+// PROGRESSIVE ESCALATION TRACKER (spec §5)
+// ─────────────────────────────────────────────
+
+interface EscalationState {
+  stepUpTimestamps: number[];
+}
+
+class EscalationTracker {
+  private state: Map<string, EscalationState> = new Map();
+
+  private get(userId: string): EscalationState {
+    if (!this.state.has(userId)) this.state.set(userId, { stepUpTimestamps: [] });
+    return this.state.get(userId)!;
+  }
+
+  recordStepUp(userId: string, ts: number): void {
+    const s = this.get(userId);
+    const cutoff = ts - ESC_WINDOW_MS;
+    s.stepUpTimestamps = s.stepUpTimestamps.filter(t => t > cutoff);
+    s.stepUpTimestamps.push(ts);
+  }
+
+  recordBlock(userId: string): void {
+    const s = this.get(userId);
+    s.stepUpTimestamps = [];
+  }
+
+  shouldForceBlock(userId: string, currentScore: number, ts: number): boolean {
+    const s      = this.get(userId);
+    const cutoff = ts - ESC_WINDOW_MS;
+    const recent = s.stepUpTimestamps.filter(t => t > cutoff).length;
+    return recent >= ESC_MIN_STEPUPS && currentScore >= ESC_RISK_THRESH;
+  }
+}
+
+// ─────────────────────────────────────────────
+// RISK ENGINES
+// ─────────────────────────────────────────────
 
 export class GeoRiskEngine {
   evaluate(tx: Transaction, profile: UserProfile, lastTx?: Transaction): RiskResult {
     let score = 0;
     const reasons: string[] = [];
 
-    // 1. City Mismatch
     if (tx.location.city !== profile.registered_city) {
       score += 10;
-      reasons.push(`Location mismatch: Tx City (${tx.location.city}) != Reg City (${profile.registered_city})`);
+      reasons.push(`ERR_GEO_IMPOSSIBLE: Location mismatch — ${tx.location.city} vs ${profile.registered_city}`);
     }
 
-    // 2. Impossible Travel
     if (lastTx) {
-      const distance = haversine(
-        lastTx.location.lat,
-        lastTx.location.lon,
-        tx.location.lat,
-        tx.location.lon
-      );
-      const timeDiffHours = (tx.timestamp - lastTx.timestamp) / (1000 * 60 * 60);
-      
-      if (timeDiffHours > 0) {
-        const speed = distance / timeDiffHours;
-        if (speed > MAX_SPEED_KMH) {
-          score += 50;
-          reasons.push(`Impossible Travel: ${distance.toFixed(1)}km in ${timeDiffHours.toFixed(2)}h (${speed.toFixed(1)} km/h)`);
-        }
+      const dist    = haversine(lastTx.location.lat, lastTx.location.lon, tx.location.lat, tx.location.lon);
+      const diffHrs = (tx.timestamp - lastTx.timestamp) / 3_600_000;
+      if (diffHrs > 0 && dist / diffHrs > MAX_SPEED_KMH) {
+        score += 55;
+        reasons.push(`ERR_GEO_IMPOSSIBLE: Impossible travel ${dist.toFixed(1)} km in ${diffHrs.toFixed(2)} h`);
       }
     }
 
-    return { score, reasoning: reasons };
+    return { score: clamp(score, 0, 65), reasoning: reasons };
   }
 }
 
@@ -131,31 +257,26 @@ export class VelocityRiskEngine {
   evaluate(tx: Transaction, recentTxns: Transaction[], profile: UserProfile): RiskResult {
     let score = 0;
     const reasons: string[] = [];
-    const now = tx.timestamp;
-    
-    // 1. Burst Detection (Last 10 mins)
-    const tenMinsAgo = now - 10 * 60 * 1000;
+    const tenMinsAgo  = tx.timestamp - 600_000;
     const recentCount = recentTxns.filter(t => t.timestamp > tenMinsAgo).length;
-    
+
     if (recentCount > 5) {
-      score += 20;
-      reasons.push(`High Velocity: ${recentCount} txns in last 10 mins`);
-    }
-
-    // 2. ₹1 Spam Burst (common in UPI)
-    const smallTxns = recentTxns.filter(t => t.timestamp > tenMinsAgo && t.amount === 1).length;
-    if (tx.amount === 1 && smallTxns > 3) {
       score += 30;
-      reasons.push('Suspected ₹1 Spam Burst');
+      reasons.push(`ERR_VELOCITY_LIMIT: ${recentCount} transactions in last 10 min`);
     }
 
-    // 3. Failed Attempts (Simulated from profile)
+    const spamCount = recentTxns.filter(t => t.timestamp > tenMinsAgo && t.amount === 1).length;
+    if (tx.amount === 1 && spamCount > 3) {
+      score += 30;
+      reasons.push('ERR_VELOCITY_LIMIT: ₹1 spam burst detected');
+    }
+
     if (profile.failed_attempts_last_10_min > 3) {
-      score += 40;
-      reasons.push(`Excessive Failed Attempts: ${profile.failed_attempts_last_10_min}`);
+      score += 35;
+      reasons.push(`ERR_VELOCITY_LIMIT: ${profile.failed_attempts_last_10_min} failed attempts in 10 min`);
     }
 
-    return { score, reasoning: reasons };
+    return { score: clamp(score, 0, 65), reasoning: reasons };
   }
 }
 
@@ -164,19 +285,17 @@ export class DeviceRiskEngine {
     let score = 0;
     const reasons: string[] = [];
 
-    // 1. New Device
     if (tx.device_id !== profile.registered_device_id) {
       score += 25;
-      reasons.push(`Unregistered Device: ${tx.device_id}`);
+      reasons.push(`ERR_BEHAVIORAL_SHIFT: Unregistered device — ${tx.device_id}`);
     }
 
-    // 2. Device Switching
     if (distinctDevicesLast5Min > 1) {
       score += 30;
-      reasons.push(`Device Switching Detected: ${distinctDevicesLast5Min} devices in 5 min`);
+      reasons.push(`ERR_BEHAVIORAL_SHIFT: Device switching — ${distinctDevicesLast5Min} devices in 5 min`);
     }
 
-    return { score, reasoning: reasons };
+    return { score: clamp(score, 0, 55), reasoning: reasons };
   }
 }
 
@@ -185,53 +304,36 @@ export class AmountRiskEngine {
     let score = 0;
     const reasons: string[] = [];
 
-    // 1. Max Limit
     if (tx.amount > profile.max_transaction_amount) {
-      score += 100; // Immediate block usually
-      reasons.push(`Exceeds Max Limit: ${tx.amount} > ${profile.max_transaction_amount}`);
-    }
-
-    // 2. Daily Limit (Simplified check)
-    if (tx.amount > profile.daily_transaction_limit) {
-      score += 50;
-      reasons.push(`Exceeds Daily Limit`);
-    }
-
-    // 3. Abnormal Spike (> 3x Average)
-    if (tx.amount > profile.avg_transaction_amount * 3) {
+      score += 75;
+      reasons.push(`ERR_VELOCITY_LIMIT: Amount ₹${tx.amount} exceeds max ₹${profile.max_transaction_amount}`);
+    } else if (tx.amount > profile.daily_transaction_limit) {
+      score += 45;
+      reasons.push('ERR_VELOCITY_LIMIT: Exceeds daily transaction limit');
+    } else if (tx.amount > profile.avg_transaction_amount * 3) {
       score += 20;
-      reasons.push(`Abnormal Amount Spike: ${tx.amount} (Avg: ${profile.avg_transaction_amount})`);
+      reasons.push(`ERR_BEHAVIORAL_SHIFT: Amount spike ₹${tx.amount} vs avg ₹${profile.avg_transaction_amount}`);
     }
 
-    return { score, reasoning: reasons };
+    return { score: clamp(score, 0, 75), reasoning: reasons };
   }
 }
 
 export class NetworkSessionRiskEngine {
-  evaluate(tx: Transaction, previousSessionId?: string): RiskResult {
+  evaluate(tx: Transaction): RiskResult {
     let score = 0;
     const reasons: string[] = [];
 
-    // 1. VPN Detection
     if (tx.network_type === 'VPN') {
-      score += 15;
-      reasons.push('VPN Detected');
+      score += 20;
+      reasons.push('ERR_BEHAVIORAL_SHIFT: VPN detected');
     }
-
-    // 2. Session Replay
-    if (previousSessionId && tx.session_id === previousSessionId) {
-      // In a real scenario, reusing a session ID for a *new* login might be bad, 
-      // but for transactions in the same session it's fine. 
-      // Let's assume this checks for concurrent usage of same session from diff IP (simplified here)
-    }
-
-    // 3. Unknown Network
     if (tx.network_type === 'UNKNOWN') {
       score += 10;
-      reasons.push('Unknown Network Type');
+      reasons.push('ERR_BEHAVIORAL_SHIFT: Unknown network type');
     }
 
-    return { score, reasoning: reasons };
+    return { score: clamp(score, 0, 30), reasoning: reasons };
   }
 }
 
@@ -240,130 +342,230 @@ export class BehavioralRiskEngine {
     let score = 0;
     let multiplier = 1.0;
     const reasons: string[] = [];
-    const date = new Date(tx.timestamp);
-    const hour = date.getHours();
+    const hour = new Date(tx.timestamp).getHours();
 
-    // 1. Unusual Time
     if (hour < profile.usual_login_times[0] || hour > profile.usual_login_times[1]) {
       score += 10;
-      reasons.push(`Transaction outside usual hours (${hour}:00)`);
+      reasons.push(`ERR_BEHAVIORAL_SHIFT: Transaction at unusual hour (${hour}:00)`);
     }
 
-    // 2. Dormant Account
     if (profile.account_status === 'DORMANT') {
-      score += 50;
-      reasons.push('Dormant Account Activation');
+      score += 45;
+      reasons.push('ERR_BEHAVIORAL_SHIFT: Dormant account activation');
     }
 
-    // 3. Risk Category Multiplier
+    if (profile.kyc_status === 'FAILED') {
+      score += 35;
+      reasons.push('ERR_BEHAVIORAL_SHIFT: KYC failed');
+    } else if (profile.kyc_status === 'PENDING') {
+      score += 10;
+      reasons.push('ERR_BEHAVIORAL_SHIFT: KYC pending');
+    }
+
     if (profile.risk_category === 'HIGH') {
       multiplier = 1.2;
-      reasons.push('High Risk User Category (1.2x Multiplier)');
+      reasons.push('High-risk user profile (1.2× multiplier)');
     } else if (profile.risk_category === 'MEDIUM') {
       multiplier = 1.1;
-      reasons.push('Medium Risk User Category (1.1x Multiplier)');
+      reasons.push('Medium-risk user profile (1.1× multiplier)');
     }
 
-    return { score, reasoning: reasons, multiplier };
+    return { score: clamp(score, 0, 65), reasoning: reasons, multiplier };
   }
 }
 
-// --- Main Aggregator ---
+// ─────────────────────────────────────────────
+// SENTINEL ENGINE — MAIN AGGREGATOR
+// ─────────────────────────────────────────────
 
 export class SentinelEngine {
-  private geoEngine = new GeoRiskEngine();
-  private velocityEngine = new VelocityRiskEngine();
-  private deviceEngine = new DeviceRiskEngine();
-  private amountEngine = new AmountRiskEngine();
-  private networkEngine = new NetworkSessionRiskEngine();
-  private behavioralEngine = new BehavioralRiskEngine();
+  private geoEngine         = new GeoRiskEngine();
+  private velocityEngine    = new VelocityRiskEngine();
+  private deviceEngine      = new DeviceRiskEngine();
+  private amountEngine      = new AmountRiskEngine();
+  private networkEngine     = new NetworkSessionRiskEngine();
+  private behavioralEngine  = new BehavioralRiskEngine();
+  private coordDetector     = new CoordinatedAttackDetector();
+  private escalationTracker = new EscalationTracker();
+  private latencyBuffer     = new RollingLatencyBuffer();
 
-  // In-memory state for simulation
   private transactionHistory: Transaction[] = [];
-  
+
+  // ── Secondary check before SEND_OTP (spec §3) ─────────────────────────
+  private secondaryCheck(tx: Transaction, _profile: UserProfile): boolean {
+    const tenMinsAgo    = tx.timestamp - 600_000;
+    const fiveMinsAgo   = tx.timestamp - 300_000;
+    const userHistory   = this.transactionHistory.filter(t => t.user_id === tx.user_id);
+    const recentCount   = userHistory.filter(t => t.timestamp > tenMinsAgo).length;
+    const recentDevices = new Set(userHistory.filter(t => t.timestamp > fiveMinsAgo).map(t => t.device_id));
+    recentDevices.add(tx.device_id);
+
+    const velocityFail   = recentCount > 8;
+    const deviceFail     = recentDevices.size > 2;
+    const coordFail      = this.coordDetector.detect(tx);
+    const escalationFail = this.escalationTracker.shouldForceBlock(tx.user_id, THRESHOLD_BLOCK, tx.timestamp);
+
+    return !(velocityFail || deviceFail || coordFail || escalationFail);
+  }
+
+  // ── Main evaluate ──────────────────────────────────────────────────────
   evaluate(tx: Transaction, profile: UserProfile): FinalRiskResult {
     const start = performance.now();
 
-    // Context gathering
-    const userHistory = this.transactionHistory.filter(t => t.user_id === tx.user_id);
-    const lastTx = userHistory[userHistory.length - 1];
-    const recentTxns = userHistory; // In prod, filter by time window
-    
-    // Distinct devices in last 5 mins
-    const fiveMinsAgo = tx.timestamp - 5 * 60 * 1000;
-    const recentDevices = new Set(
-      userHistory
-        .filter(t => t.timestamp > fiveMinsAgo)
-        .map(t => t.device_id)
-    );
-    recentDevices.add(tx.device_id);
-
-    // Evaluate Components
-    const geo = this.geoEngine.evaluate(tx, profile, lastTx);
-    const velocity = this.velocityEngine.evaluate(tx, recentTxns, profile);
-    const device = this.deviceEngine.evaluate(tx, profile, recentDevices.size);
-    const amount = this.amountEngine.evaluate(tx, profile);
-    const network = this.networkEngine.evaluate(tx);
-    const behavioral = this.behavioralEngine.evaluate(tx, profile);
-
-    // Weighted Sum (Simplified: 1.0 weight for all)
-    let finalScore = 
-      geo.score + 
-      velocity.score + 
-      device.score + 
-      amount.score + 
-      network.score + 
-      behavioral.score;
-
-    // Apply Multiplier
-    if (behavioral.multiplier && behavioral.multiplier > 1) {
-      finalScore = Math.floor(finalScore * behavioral.multiplier);
+    // Blocked user short-circuit
+    if (profile.account_status === 'BLOCKED') {
+      const ms = performance.now() - start;
+      this.latencyBuffer.record(ms);
+      return this.buildResult(
+        tx, 100,
+        { geo_risk: 0, velocity_risk: 0, device_risk: 0, amount_risk: 0, network_risk: 0, behavioral_risk: 0 },
+        'BLOCK', ['ERR_BLOCKED_USER: Account is permanently blocked'],
+        'ERR_BLOCKED_USER', ms, false, false
+      );
     }
 
-    // Clamp to 0-100
-    finalScore = Math.min(100, Math.max(0, finalScore));
+    const userHistory   = this.transactionHistory.filter(t => t.user_id === tx.user_id);
+    const lastTx        = userHistory[userHistory.length - 1];
+    const fiveMinsAgo   = tx.timestamp - 300_000;
+    const recentDevices = new Set(userHistory.filter(t => t.timestamp > fiveMinsAgo).map(t => t.device_id));
+    recentDevices.add(tx.device_id);
 
-    // Decision Logic
+    const geo       = this.geoEngine.evaluate(tx, profile, lastTx);
+    const velocity  = this.velocityEngine.evaluate(tx, userHistory, profile);
+    const device    = this.deviceEngine.evaluate(tx, profile, recentDevices.size);
+    const amount    = this.amountEngine.evaluate(tx, profile);
+    const network   = this.networkEngine.evaluate(tx);
+    const behav     = this.behavioralEngine.evaluate(tx, profile);
+
+    const componentScores = {
+      geo_risk:        geo.score,
+      velocity_risk:   velocity.score,
+      device_risk:     device.score,
+      amount_risk:     amount.score,
+      network_risk:    network.score,
+      behavioral_risk: behav.score,
+    };
+
+    let baseScore = geo.score + velocity.score + device.score + amount.score + network.score + behav.score;
+
+    if (behav.multiplier && behav.multiplier > 1) {
+      baseScore = Math.floor(baseScore * behav.multiplier);
+    }
+
+    // Coordinated attack amplification (spec §4)
+    let coordinated = false;
+    this.coordDetector.record(tx);
+    if (this.coordDetector.detect(tx)) {
+      baseScore   = Math.floor(baseScore * COORD_MULTIPLIER);
+      coordinated = true;
+    }
+
+    let finalScore = clamp(baseScore);
+
+    const allReasons = [
+      ...geo.reasoning, ...velocity.reasoning, ...device.reasoning,
+      ...amount.reasoning, ...network.reasoning, ...behav.reasoning,
+    ];
+
+    if (coordinated) {
+      allReasons.push('ERR_COORDINATED_ATTACK: Coordinated cluster detected (1.25× amplifier)');
+    }
+
+    // Decision logic (spec §2 + §3 + §5)
     let decision: 'APPROVE' | 'STEP_UP' | 'BLOCK' = 'APPROVE';
-    if (finalScore >= 60) decision = 'BLOCK';
-    else if (finalScore >= 30) decision = 'STEP_UP';
+    let reasonCode: ReasonCode = 'OK';
+    let escalationOverride = false;
 
-    // Store history (cap at 1000 entries to prevent unbounded memory growth)
+    if (finalScore >= THRESHOLD_BLOCK) {
+      decision   = 'BLOCK';
+      reasonCode = coordinated ? 'ERR_COORDINATED_ATTACK' : this.primaryReasonCode(allReasons);
+    } else if (finalScore >= THRESHOLD_PASS) {
+      // Progressive escalation check first (spec §5)
+      if (this.escalationTracker.shouldForceBlock(tx.user_id, finalScore, tx.timestamp)) {
+        decision          = 'BLOCK';
+        reasonCode        = 'ERR_ESCALATION_OVERRIDE';
+        escalationOverride = true;
+        finalScore        = Math.max(finalScore, 70);
+        allReasons.push('ERR_ESCALATION_OVERRIDE: ≥3 OTP challenges in 15 min with risk ≥ 60 → forced BLOCK');
+      } else {
+        // Secondary check before issuing STEP_UP (spec §3)
+        const otpAllowed = this.secondaryCheck(tx, profile);
+        if (otpAllowed) {
+          decision   = 'STEP_UP';
+          reasonCode = this.primaryReasonCode(allReasons);
+        } else {
+          decision   = 'BLOCK';
+          reasonCode = this.primaryReasonCode(allReasons);
+        }
+      }
+    }
+
+    // Update escalation state
+    if (decision === 'STEP_UP') this.escalationTracker.recordStepUp(tx.user_id, tx.timestamp);
+    if (decision === 'BLOCK')   this.escalationTracker.recordBlock(tx.user_id);
+
+    // Store history (capped at 1000)
     this.transactionHistory.push(tx);
     if (this.transactionHistory.length > 1000) {
       this.transactionHistory = this.transactionHistory.slice(-1000);
     }
 
-    const end = performance.now();
+    const ms = performance.now() - start;
+    this.latencyBuffer.record(ms);
 
+    return this.buildResult(tx, finalScore, componentScores, decision, allReasons, reasonCode, ms, coordinated, escalationOverride);
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────
+  private primaryReasonCode(reasons: string[]): ReasonCode {
+    const priority: ReasonCode[] = [
+      'ERR_CHAIN_MISMATCH', 'ERR_ESCALATION_OVERRIDE', 'ERR_COORDINATED_ATTACK',
+      'ERR_GEO_IMPOSSIBLE', 'ERR_VELOCITY_LIMIT', 'ERR_BEHAVIORAL_SHIFT',
+    ];
+    for (const code of priority) {
+      if (reasons.some(r => r.startsWith(code))) return code;
+    }
+    return 'OK';
+  }
+
+  private buildResult(
+    tx: Transaction,
+    score: number,
+    componentScores: FinalRiskResult['component_scores'],
+    decision: FinalRiskResult['decision'],
+    reasons: string[],
+    reasonCode: ReasonCode,
+    ms: number,
+    coordinated: boolean,
+    escalation: boolean,
+  ): FinalRiskResult {
     return {
-      transaction_id: tx.transaction_id,
-      user_id: tx.user_id,
-      amount: tx.amount,
-      timestamp: tx.timestamp,
-      final_risk_score: finalScore,
-      component_scores: {
-        geo_risk: geo.score,
-        velocity_risk: velocity.score,
-        device_risk: device.score,
-        amount_risk: amount.score,
-        network_risk: network.score,
-        behavioral_risk: behavioral.score,
-      },
+      transaction_id:      tx.transaction_id,
+      user_id:             tx.user_id,
+      amount:              tx.amount,
+      timestamp:           tx.timestamp,
+      final_risk_score:    score,
+      component_scores:    componentScores,
       decision,
-      reasoning: [
-        ...geo.reasoning,
-        ...velocity.reasoning,
-        ...device.reasoning,
-        ...amount.reasoning,
-        ...network.reasoning,
-        ...behavioral.reasoning,
-      ],
-      processing_time_ms: end - start,
+      reasoning:           reasons,
+      reason_code:         reasonCode,
+      processing_time_ms:  ms,
+      latency_breach:      this.latencyBuffer.isBreach(),
+      coordinated_attack:  coordinated,
+      escalation_override: escalation,
     };
   }
 
   getHistory(userId: string): Transaction[] {
     return this.transactionHistory.filter(t => t.user_id === userId);
   }
+
+  getLatencyStats(): { average: number; breach: boolean; history: number[] } {
+    return {
+      average: this.latencyBuffer.average(),
+      breach:  this.latencyBuffer.isBreach(),
+      history: this.latencyBuffer.snapshot(),
+    };
+  }
 }
+

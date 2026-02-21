@@ -33,8 +33,8 @@ const StatusBadge = ({ status }: { status: string }) => {
 
 const RiskScoreGauge = ({ score }: { score: number }) => {
   let color = 'text-emerald-500';
-  if (score >= 60) color = 'text-rose-500';
-  else if (score >= 30) color = 'text-amber-500';
+  if (score >= 70) color = 'text-rose-500';
+  else if (score >= 40) color = 'text-amber-500';
 
   return (
     <div className="relative flex items-center justify-center w-32 h-32">
@@ -564,7 +564,7 @@ export default function App() {
                 <div className="text-xs text-slate-500 font-mono mb-1 truncate">{tx.user_id}</div>
                 <div className="flex justify-between items-end">
                   <div className="text-xs text-slate-400">
-                    Risk: <span className={tx.final_risk_score >= 60 ? 'text-rose-500' : tx.final_risk_score >= 30 ? 'text-amber-400' : 'text-emerald-500'}>{tx.final_risk_score}</span>
+                    Risk: <span className={tx.final_risk_score >= 70 ? 'text-rose-500' : tx.final_risk_score >= 40 ? 'text-amber-400' : 'text-emerald-500'}>{tx.final_risk_score}</span>
                   </div>
                   <div className="text-xs font-mono text-slate-600">{new Date(tx.timestamp).toLocaleTimeString()}</div>
                 </div>
@@ -674,7 +674,7 @@ export default function App() {
                       </RadialBarChart>
                     </ResponsiveContainer>
                     <div className="absolute inset-0 flex items-center justify-center flex-col pointer-events-none mt-8">
-                      <span className={cn("text-3xl font-bold font-mono", selectedTx.final_risk_score > 60 ? "text-rose-500" : "text-emerald-500")}>
+                      <span className={cn("text-3xl font-bold font-mono", selectedTx.final_risk_score >= 70 ? "text-rose-500" : selectedTx.final_risk_score >= 40 ? "text-amber-500" : "text-emerald-500")}>
                         {selectedTx.final_risk_score}
                       </span>
                       <span className="text-[10px] text-slate-500 uppercase tracking-wider">Risk Score</span>
@@ -732,7 +732,7 @@ export default function App() {
                             <div 
                               className={cn(
                                 'h-full rounded-full transition-all duration-500',
-                                item.score >= 60 ? 'bg-rose-500' : item.score >= 30 ? 'bg-amber-400' : item.score > 0 ? 'bg-emerald-400' : 'bg-slate-700'
+                                item.score >= 70 ? 'bg-rose-500' : item.score >= 40 ? 'bg-amber-400' : item.score > 0 ? 'bg-emerald-400' : 'bg-slate-700'
                               )}
                               style={{ width: `${Math.min(item.score, 100)}%` }}
                             ></div>
@@ -743,6 +743,29 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+
+                {/* Badges: latency_breach, coordinated_attack, escalation_override */}
+                {(selectedTx.latency_breach || selectedTx.coordinated_attack || selectedTx.escalation_override) && (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {selectedTx.latency_breach && (
+                      <span className="px-2 py-0.5 rounded text-xs font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20">⚠ LATENCY BREACH</span>
+                    )}
+                    {selectedTx.coordinated_attack && (
+                      <span className="px-2 py-0.5 rounded text-xs font-mono bg-rose-500/10 text-rose-400 border border-rose-500/20">⚠ COORDINATED ATTACK</span>
+                    )}
+                    {selectedTx.escalation_override && (
+                      <span className="px-2 py-0.5 rounded text-xs font-mono bg-purple-500/10 text-purple-400 border border-purple-500/20">⚠ ESCALATION OVERRIDE</span>
+                    )}
+                  </div>
+                )}
+
+                {/* Reason Code */}
+                {'reason_code' in selectedTx && selectedTx.reason_code && selectedTx.reason_code !== 'OK' && (
+                  <div className="mt-3 flex items-center gap-2 p-2 bg-slate-950/60 rounded-lg border border-slate-800">
+                    <span className="text-[10px] text-slate-500 uppercase tracking-wider">Reason Code</span>
+                    <span className="text-xs font-mono text-rose-300">{(selectedTx as any).reason_code}</span>
+                  </div>
+                )}
 
                 {/* Reasoning */}
                 {selectedTx.reasoning.length > 0 && (
