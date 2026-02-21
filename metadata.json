@@ -1,0 +1,5 @@
+{
+  "name": "SentinelPay",
+  "description": "Real-Time UPI Fraud Firewall Prototype with Deterministic Risk Scoring and Immutable Ledger",
+  "requestFramePermissions": []
+}
