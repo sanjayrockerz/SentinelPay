@@ -1,20 +1,23 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+🚨 SentinelPay — Real-Time UPI Fraud Firewall
 
-# Run and deploy your AI Studio app
+SentinelPay is a high-performance fraud detection engine designed for UPI transaction streams. The system focuses on deterministic blocking while ensuring minimal false positives through multi-layer verification and OTP step-up validation.
 
-This contains everything you need to run your app locally.
+🔥 Core Features
 
-View your app in AI Studio: https://ai.studio/apps/7de992de-caa7-42c1-809f-082cd13375f6
+⚡ ≤ 200ms Processing Constraint (Hard Performance Bound)
 
-## Run Locally
+🧠 Risk-Based Decision Engine (PASS / SEND_OTP / BLOCK)
 
-**Prerequisites:**  Node.js
+👥 Coordinated Attack Detection (Cross-User Clustering)
 
+📈 Progressive Risk Escalation (Behavioral Tracking)
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+🔐 OTP Step-Up Verification Layer
+
+⛓ Blockchain-Style Hash Chain Integrity
+
+🚨 100% Tamper Detection (System Freeze on Mismatch)
+
+📊 Real-Time Latency Monitoring
+
+🎯 Accuracy Target ≥ 95%
